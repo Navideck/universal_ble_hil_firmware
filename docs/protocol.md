@@ -68,6 +68,8 @@ It can be read with no BLE connection.
 | `14` | Notification pressure | None | Attempt 128 notification sends with completion callbacks in one system-workqueue invocation |
 | `15` | Arm next connection fault | Delay `uint16` | One-shot plan survives host disconnect and starts its disconnect timer inside the next connection callback |
 | `16` | Arm service-declaration fault | Five-byte fault payload | Alter the next read of the HIL primary-service declaration, including uncached service discovery |
+| `17` | Set HID service | One byte: `00` removed or `01` added | Dynamically add or remove a minimal HID over GATT service (`0x1812`) with HID Information and Report Map characteristics. Windows reserves this service for its HID driver, so it tests how a host treats a restricted service |
+| `18` | Pause advertising | Pause in milliseconds, `uint16` | Stop advertising now and resume after the pause, including after a disconnect during it. Lets a host test a device that goes out of range and returns. Reset ends a pause early |
 
 The fault-command payload is five bytes: one ATT error byte, a `uint16`
 callback delay in milliseconds, and a `uint16` peripheral-disconnect delay. An
@@ -128,6 +130,8 @@ The state characteristic returns 16 bytes:
 - Scheduled disconnect and burst work: cancelled
 - Armed read and write faults: cleared
 - Notify-on-subscribe plan: cleared
+- HID service: removed
+- Advertising pause: ended; advertising resumes at once when not connected
 - Auxiliary service: removed through delayed work
 - Armed CCC delay: cleared
 

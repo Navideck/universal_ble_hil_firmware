@@ -53,6 +53,8 @@ enum hil_command
     HIL_COMMAND_NOTIFY_PRESSURE = 0x14,
     HIL_COMMAND_ARM_CONNECT_FAULT = 0x15,
     HIL_COMMAND_ARM_DISCOVERY_FAULT = 0x16,
+    HIL_COMMAND_SET_HID_SERVICE = 0x17,
+    HIL_COMMAND_PAUSE_ADVERTISING = 0x18,
 };
 
 struct hil_operation_fault
@@ -109,6 +111,9 @@ static struct hil_operation_fault descriptor_read_fault;
 static struct hil_operation_fault descriptor_write_fault;
 static bool notify_on_subscribe_armed;
 static bool auxiliary_service_requested;
+static struct k_work_delayable hid_service_work;
+static bool hid_service_requested;
+static int64_t advertising_paused_until_ms;
 static uint16_t ccc_delay_ms;
 static bool indicate_on_subscribe_armed;
 static atomic_t indication_pending;
@@ -194,6 +199,62 @@ static void auxiliary_service_work_handler(struct k_work *work)
     }
 }
 
+/* A minimal HID over GATT service. Windows reserves this service for its own
+ * HID driver and denies apps access to it, which lets the host test how a
+ * restricted service is handled. It is registered only on request, so the
+ * fixture is not taken for an input device otherwise. */
+static const uint8_t hid_information[] = {0x11, 0x01, 0x00, 0x02};
+static const uint8_t hid_report_map[] = {
+    0x05, 0x01, /* Usage Page (Generic Desktop) */
+    0x09, 0x06, /* Usage (Keyboard) */
+    0xa1, 0x01, /* Collection (Application) */
+    0xc0,       /* End Collection */
+};
+
+static ssize_t read_hid_static(struct bt_conn *conn,
+                               const struct bt_gatt_attr *attr, void *buf,
+                               uint16_t len, uint16_t offset)
+{
+    const uint8_t *value = attr->user_data;
+    const uint16_t length = value == hid_information ? sizeof(hid_information)
+                                                     : sizeof(hid_report_map);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, value, length);
+}
+
+static struct bt_gatt_attr hid_service_attrs[] = {
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_HIDS),
+    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_INFO, BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ, read_hid_static, NULL,
+                           (void *)hid_information),
+    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT_MAP, BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ, read_hid_static, NULL,
+                           (void *)hid_report_map),
+};
+
+static struct bt_gatt_service hid_service = BT_GATT_SERVICE(hid_service_attrs);
+
+static void hid_service_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    bool registered = bt_gatt_service_is_registered(&hid_service);
+    int err = 0;
+
+    if (hid_service_requested && !registered)
+    {
+        err = bt_gatt_service_register(&hid_service);
+    }
+    else if (!hid_service_requested && registered)
+    {
+        err = bt_gatt_service_unregister(&hid_service);
+    }
+
+    if (err != 0)
+    {
+        LOG_ERR("Failed to %s HID service (err %d)",
+                hid_service_requested ? "register" : "unregister", err);
+    }
+}
+
 static void cancel_disconnect(struct bt_conn *expected)
 {
     k_spinlock_key_t key = k_spin_lock(&disconnect_lock);
@@ -261,6 +322,12 @@ static void reset_state(void)
     memset(&descriptor_write_fault, 0, sizeof(descriptor_write_fault));
     notify_on_subscribe_armed = false;
     auxiliary_service_requested = false;
+    hid_service_requested = false;
+    if (advertising_paused_until_ms != 0)
+    {
+        advertising_paused_until_ms = 0;
+        k_work_reschedule(&advertising_work, K_NO_WAIT);
+    }
     ccc_delay_ms = 0;
     indicate_on_subscribe_armed = false;
     ccc_fault_action = 0;
@@ -789,6 +856,23 @@ static ssize_t execute_control(const uint8_t *command, uint16_t len, bool *reboo
         k_work_reschedule(&auxiliary_service_work,
                           K_MSEC(sys_get_le16(&payload[1])));
         break;
+    case HIL_COMMAND_SET_HID_SERVICE:
+        if (payload_length != 1 || payload[0] > 1)
+        {
+            return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+        }
+        hid_service_requested = payload[0] != 0;
+        k_work_reschedule(&hid_service_work, K_MSEC(25));
+        break;
+    case HIL_COMMAND_PAUSE_ADVERTISING:
+        if (payload_length != 2)
+        {
+            return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+        }
+        advertising_paused_until_ms = k_uptime_get() + sys_get_le16(payload);
+        (void)bt_le_adv_stop();
+        k_work_reschedule(&advertising_work, K_MSEC(sys_get_le16(payload)));
+        break;
     case HIL_COMMAND_ARM_CCC_DELAY:
         if (payload_length != 2)
         {
@@ -1130,6 +1214,13 @@ static int start_advertising(void)
 static void advertising_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
+    const int64_t paused_for = advertising_paused_until_ms - k_uptime_get();
+    if (paused_for > 0)
+    {
+        k_work_reschedule(&advertising_work, K_MSEC(paused_for));
+        return;
+    }
+    advertising_paused_until_ms = 0;
     int err = start_advertising();
     if (err != 0)
     {
@@ -1213,6 +1304,7 @@ int main(void)
     k_work_init_delayable(&burst_work, burst_work_handler);
     k_work_init_delayable(&auxiliary_service_work,
                           auxiliary_service_work_handler);
+    k_work_init_delayable(&hid_service_work, hid_service_work_handler);
     reset_state();
 
     int err = bt_enable(NULL);

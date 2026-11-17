@@ -55,6 +55,7 @@ enum hil_command
     HIL_COMMAND_ARM_DISCOVERY_FAULT = 0x16,
     HIL_COMMAND_SET_HID_SERVICE = 0x17,
     HIL_COMMAND_PAUSE_ADVERTISING = 0x18,
+    HIL_COMMAND_SET_BONDING = 0x19,
 };
 
 struct hil_operation_fault
@@ -114,6 +115,7 @@ static bool auxiliary_service_requested;
 static struct k_work_delayable hid_service_work;
 static bool hid_service_requested;
 static int64_t advertising_paused_until_ms;
+static bool bonding_enabled;
 static uint16_t ccc_delay_ms;
 static bool indicate_on_subscribe_armed;
 static atomic_t indication_pending;
@@ -255,6 +257,39 @@ static void hid_service_work_handler(struct k_work *work)
     }
 }
 
+/* Pairing is refused unless a test enabled it, so the rest of the suite runs
+ * against an unbonded peripheral. Just Works: no passkey, no user prompt on
+ * the fixture. Bonds live in RAM only and are cleared by reset. */
+static enum bt_security_err pairing_accept(
+    struct bt_conn *conn, const struct bt_conn_pairing_feat *const feat)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(feat);
+    if (!bonding_enabled)
+    {
+        LOG_INF("Pairing refused: bonding not enabled");
+        return BT_SECURITY_ERR_PAIR_NOT_ALLOWED;
+    }
+    return BT_SECURITY_ERR_SUCCESS;
+}
+
+static struct bt_conn_auth_cb auth_callbacks = {
+    .pairing_accept = pairing_accept,
+};
+
+static void count_bond(const struct bt_bond_info *info, void *user_data)
+{
+    ARG_UNUSED(info);
+    ++*(int *)user_data;
+}
+
+static int bond_count(void)
+{
+    int count = 0;
+    bt_foreach_bond(BT_ID_DEFAULT, count_bond, &count);
+    return count;
+}
+
 static void cancel_disconnect(struct bt_conn *expected)
 {
     k_spinlock_key_t key = k_spin_lock(&disconnect_lock);
@@ -323,6 +358,13 @@ static void reset_state(void)
     notify_on_subscribe_armed = false;
     auxiliary_service_requested = false;
     hid_service_requested = false;
+    bonding_enabled = false;
+    /* Removing a bond also drops a connection to that peer, so only when
+     * there is one: reset otherwise keeps the active connection. */
+    if (bond_count() > 0)
+    {
+        (void)bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+    }
     if (advertising_paused_until_ms != 0)
     {
         advertising_paused_until_ms = 0;
@@ -393,6 +435,8 @@ static ssize_t read_state(struct bt_conn *conn, const struct bt_gatt_attr *attr,
     sys_put_le32(state.writes_with_response, &value[4]);
     sys_put_le32(state.writes_without_response, &value[8]);
     sys_put_le16(bt_gatt_get_mtu(conn), &value[12]);
+    value[14] = (uint8_t)bt_conn_get_security(conn);
+    value[15] = (uint8_t)bond_count();
     return read_buffer(conn, attr, buf, len, offset, value, sizeof(value));
 }
 
@@ -864,6 +908,13 @@ static ssize_t execute_control(const uint8_t *command, uint16_t len, bool *reboo
         hid_service_requested = payload[0] != 0;
         k_work_reschedule(&hid_service_work, K_MSEC(25));
         break;
+    case HIL_COMMAND_SET_BONDING:
+        if (payload_length != 1 || payload[0] > 1)
+        {
+            return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+        }
+        bonding_enabled = payload[0] != 0;
+        break;
     case HIL_COMMAND_PAUSE_ADVERTISING:
         if (payload_length != 2)
         {
@@ -1277,9 +1328,17 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     k_work_reschedule(&advertising_work, K_MSEC(100));
 }
 
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+                             enum bt_security_err err)
+{
+    ARG_UNUSED(conn);
+    LOG_INF("Security level %d (err %d), bonds %d", level, err, bond_count());
+}
+
 BT_CONN_CB_DEFINE(connection_callbacks) = {
     .connected = connected,
     .disconnected = disconnected,
+    .security_changed = security_changed,
 };
 
 static void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
@@ -1314,6 +1373,7 @@ int main(void)
         return err;
     }
     bt_gatt_cb_register(&gatt_callbacks);
+    bt_conn_auth_cb_register(&auth_callbacks);
 
     err = start_advertising();
     if (err != 0)

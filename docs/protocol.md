@@ -70,6 +70,7 @@ It can be read with no BLE connection.
 | `16` | Arm service-declaration fault | Five-byte fault payload | Alter the next read of the HIL primary-service declaration, including uncached service discovery |
 | `17` | Set HID service | One byte: `00` removed or `01` added | Dynamically add or remove a minimal HID over GATT service (`0x1812`) with HID Information and Report Map characteristics. Windows reserves this service for its HID driver, so it tests how a host treats a restricted service |
 | `18` | Pause advertising | Pause in milliseconds, `uint16` | Stop advertising now and resume after the pause, including after a disconnect during it. Lets a host test a device that goes out of range and returns. Reset ends a pause early |
+| `19` | Set bonding | One byte: `00` refuse or `01` accept pairing | Accept Just Works pairing and keep the bond in RAM. Off by default so the rest of the suite runs unbonded |
 
 The fault-command payload is five bytes: one ATT error byte, a `uint16`
 callback delay in milliseconds, and a `uint16` peripheral-disconnect delay. An
@@ -119,7 +120,8 @@ The state characteristic returns 16 bytes:
 | 4      | 4    | Successful writes with response    |
 | 8      | 4    | Successful writes without response |
 | 12     | 2    | Current ATT MTU                    |
-| 14     | 2    | Reserved, zero                     |
+| 14     | 1    | Link security level (1 to 4)       |
+| 15     | 1    | Bonds stored on the fixture        |
 
 ## 4. Reset state
 
@@ -131,6 +133,7 @@ The state characteristic returns 16 bytes:
 - Armed read and write faults: cleared
 - Notify-on-subscribe plan: cleared
 - HID service: removed
+- Bonding: refused again; existing bonds are deleted, which drops a connection to a bonded peer
 - Advertising pause: ended; advertising resumes at once when not connected
 - Auxiliary service: removed through delayed work
 - Armed CCC delay: cleared
